@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>wish wasm runtime</title>
+</head>
+<body>
+<!--
+  The page half of the web view backend: a run registry, the caches that make a
+  second invocation cheap, and the bridge to Swift.
+
+  The script is inline rather than an external file on purpose. Loading a
+  `<script src>` from a document served by a WKURLSchemeHandler crashes the web
+  content process on iOS 26 before 26.0 beta 5 (WebKit bug 296698), which
+  presents as the backend silently never becoming ready. The worker is fetched
+  as text and started from a blob URL, which inherits this document's origin and
+  avoids the same path.
+-->
+<script>
+'use strict';
+
+const bridge = window.webkit.messageHandlers.wish;
+const runs = new Map();
+
+// Compiling a 9.6 MB module takes long enough that doing it once per command
+// would undo the point of the backend. Both caches are keyed by a signature
+// Swift computes from size and mtime — the same bet `ModuleCache` makes on the
+// interpreter side.
+const modules = new Map();
+const snapshots = new Map();
+
+// Bounded because this lives in the web content process, which iOS jetsams at
+// its own limit rather than the app's. A zig standard library is ~18 MB, so
+// this holds a couple of toolchains and evicts the rest.
+const SNAPSHOT_CACHE_LIMIT = 96 << 20;
+let snapshotCacheBytes = 0;
+
+let workerSource = null;
+
+function send(message) {
+  bridge.postMessage(message);
+}
+
+/// btoa cannot take a 10 MB string, and `String.fromCharCode(...bytes)` blows
+/// the argument limit well before that. 8 KB at a time is the safe shape.
+///
+/// Takes a `Uint8Array`, deliberately, and never an `ArrayBuffer`. A view's
+/// `.buffer` is the whole underlying allocation, not the view — so encoding
+/// `chunk.buffer` sends the entire diff for every chunk of it. That bug shipped
+/// here and cost a 46 MB write-back 659 MB of base64.
+function base64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 8192) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  }
+  return btoa(binary);
+}
+
+/// Always names the URL. A bare fetch rejection here is "TypeError: Load
+/// failed" with no indication of which of the module, the worker, or one of
+/// several snapshots it was, and that is a bad half hour.
+async function fetchBuffer(url) {
+  let response;
+  try {
+    response = await fetch(url);
+  } catch (error) {
+    throw new Error(`${url}: ${error}`);
+  }
+  if (!response.ok) throw new Error(`${url}: ${response.status}`);
+  return await response.arrayBuffer();
+}
+
+function rememberSnapshot(signature, buffer) {
+  if (buffer.byteLength > SNAPSHOT_CACHE_LIMIT) return;
+  // Insertion-ordered, so the first key is the least recently added.
+  while (snapshotCacheBytes + buffer.byteLength > SNAPSHOT_CACHE_LIMIT && snapshots.size) {
+    const oldest = snapshots.keys().next().value;
+    snapshotCacheBytes -= snapshots.get(oldest).byteLength;
+    snapshots.delete(oldest);
+  }
+  snapshots.set(signature, buffer);
+  snapshotCacheBytes += buffer.byteLength;
+}
+
+function readVarUint(bytes, pos) {
+  let result = 0;
+  let shift = 0;
+  let byte;
+  do {
+    byte = bytes[pos++];
+    // Not `<<`: a section size can exceed what a 32-bit shift holds.
+    result += (byte & 0x7f) * Math.pow(2, shift);
+    shift += 7;
+  } while (byte & 0x80);
+  return [result, pos];
+}
+
+/// Removes a module's start section when it is the WASI entry point.
+///
+/// Zig's self-hosted wasm linker emits `_start` *both* as an export and as the
+/// module's start section — LLVM-built modules only do the former. A start
+/// section runs during `WebAssembly.instantiate`, before the call returns, so
+/// the guest is already executing WASI calls at a point where no JavaScript has
+/// an `Instance` to read `exports.memory` from. Every such call then dies on
+/// "null is not an object (evaluating 'this.memory.buffer')" somewhere inside
+/// `std.start.startWasi`.
+///
+/// WasmKit does not have this problem: a host function there receives the
+/// calling instance and looks the memory up per call. The JS API has no
+/// equivalent of that caller, so the fix is to stop the entry point running
+/// implicitly and let the worker call the export instead — which is what
+/// `_start` means anyway.
+///
+/// Only when the two point at the same function, so this can never turn a
+/// genuine initialiser into a skipped one; anything else is left alone.
+function deferEntryPoint(buffer) {
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length < 8) return buffer;
+
+  let p = 8;
+  let cut = null;
+  let startFunc = null;
+  let exported = null;
+  const decoder = new TextDecoder();
+
+  while (p < bytes.length) {
+    const sectionAt = p;
+    const id = bytes[p++];
+    const header = readVarUint(bytes, p);
+    const size = header[0];
+    const body = header[1];
+
+    if (id === 8) {
+      startFunc = readVarUint(bytes, body)[0];
+      cut = [sectionAt, body + size];
+    } else if (id === 7) {
+      let q = body;
+      const counted = readVarUint(bytes, q);
+      const count = counted[0];
+      q = counted[1];
+      for (let i = 0; i < count; i++) {
+        const named = readVarUint(bytes, q);
+        const nameLength = named[0];
+        q = named[1];
+        const name = decoder.decode(bytes.subarray(q, q + nameLength));
+        q += nameLength;
+        const kind = bytes[q++];
+        const indexed = readVarUint(bytes, q);
+        q = indexed[1];
+        if (kind === 0 && name === '_start') exported = indexed[0];
+      }
+    }
+    p = body + size;
+  }
+
+  if (cut === null || startFunc === null || startFunc !== exported) return buffer;
+
+  // Sections are self-contained and carry no absolute offsets, so removing one
+  // is a splice rather than a relocation.
+  const out = new Uint8Array(bytes.length - (cut[1] - cut[0]));
+  out.set(bytes.subarray(0, cut[0]), 0);
+  out.set(bytes.subarray(cut[1]), cut[0]);
+  return out.buffer;
+}
+
+async function loadModule(spec) {
+  const cached = modules.get(spec.moduleSignature);
+  if (cached) return cached;
+  // Not `compileStreaming`: it would overlap compilation with the transfer,
+  // but it rejects with an unlabelled TypeError when anything goes wrong and
+  // the cache means this only happens once per module anyway.
+  const compiled = await WebAssembly.compile(
+    deferEntryPoint(await fetchBuffer(spec.moduleURL)));
+  modules.set(spec.moduleSignature, compiled);
+  return compiled;
+}
+
+/// Returns a buffer the worker may take ownership of.
+///
+/// A read-only mount is cached and copied per run; a writable one is fetched
+/// fresh, because the guest may have changed it last time and the host is the
+/// authority. This is exactly the distinction `BinManifest.Access` was carrying.
+async function loadSnapshot(preopen) {
+  if (!preopen.readOnly) return await fetchBuffer(preopen.url);
+  const cached = snapshots.get(preopen.signature);
+  if (cached) return cached.slice(0);
+  const buffer = await fetchBuffer(preopen.url);
+  rememberSnapshot(preopen.signature, buffer);
+  return buffer.slice(0);
+}
+
+async function ensureWorkerSource() {
+  if (workerSource) return workerSource;
+  const buffer = await fetchBuffer('/worker.js');
+  const text = new TextDecoder().decode(buffer);
+  workerSource = URL.createObjectURL(new Blob([text], { type: 'text/javascript' }));
+  return workerSource;
+}
+
+const WishWasm = {
+  async start(spec) {
+    const state = { worker: null, cancelled: false };
+    runs.set(spec.run, state);
+
+    // Phase timings, reported with the exit status. The cost of this backend
+    // is moving bytes, not running them, so knowing which byte-moving step
+    // dominates is the difference between optimising and guessing.
+    const began = performance.now();
+    const timing = {};
+    const since = (mark) => Math.round(performance.now() - mark);
+
+    try {
+      const modulePhase = performance.now();
+      const modulePromise = loadModule(spec).then((m) => {
+        timing.module = since(modulePhase);
+        return m;
+      });
+      const snapshotPhase = performance.now();
+      const snapshotPromises = spec.preopens.map((preopen, i) =>
+        loadSnapshot(preopen).then((buffer) => {
+          timing['preopen' + i] = since(snapshotPhase);
+          timing['preopen' + i + 'MB'] = Math.round(buffer.byteLength / (1 << 20));
+          return buffer;
+        }));
+
+      const [module, source, ...buffers] = await Promise.all([
+        modulePromise,
+        ensureWorkerSource(),
+        ...snapshotPromises,
+      ]);
+      timing.load = since(began);
+      if (state.cancelled) return;
+
+      const worker = new Worker(source);
+      state.worker = worker;
+
+      worker.onmessage = (event) => {
+        const message = event.data;
+        if (message.type === 'output') {
+          send({ type: 'output', run: spec.run, data: base64(new Uint8Array(message.bytes)) });
+          return;
+        }
+        if (message.type === 'exit') {
+          timing.guest = message.guest;
+          timing.diff = message.diffMs;
+          timing.total = since(began);
+          // The diff goes over in pieces: a WKScriptMessage body is a JSON
+          // value, so this is base64 either way, and one 100 MB string is a
+          // reliable way to be jetsammed.
+          const bytes = new Uint8Array(message.diff);
+          const CHUNK = 4 << 20;
+          for (let o = 0; o < bytes.length; o += CHUNK) {
+            send({
+              type: 'diff',
+              run: spec.run,
+              data: base64(bytes.subarray(o, Math.min(o + CHUNK, bytes.length))),
+            });
+          }
+          // Last, so Swift knows every byte of output and every file has landed.
+          send({ type: 'exit', run: spec.run, status: message.status, timing });
+          WishWasm.finish(spec.run);
+          return;
+        }
+        if (message.type === 'failed') {
+          send({ type: 'failed', run: spec.run, message: message.message });
+          WishWasm.finish(spec.run);
+        }
+      };
+
+      worker.onerror = (event) => {
+        send({ type: 'failed', run: spec.run, message: event.message || 'worker error' });
+        WishWasm.finish(spec.run);
+      };
+
+      worker.postMessage({
+        module,
+        argv0: spec.argv0,
+        arguments: spec.arguments,
+        environment: spec.environment,
+        preopens: spec.preopens,
+        snapshots: buffers,
+        // Where the worker makes its blocking calls — stdin reads and sleeps.
+        // Both are synchronous XHRs, which is why they cannot go through this
+        // page: the answer has to arrive without the worker's event loop
+        // turning, and only Swift is on the other end.
+        syncURL: spec.syncURL,
+      }, buffers);
+    } catch (error) {
+      send({ type: 'failed', run: spec.run, message: String((error && error.stack) || error) });
+      WishWasm.finish(spec.run);
+    }
+  },
+
+  /// Terminating the worker is the whole of cancellation, and it is the one
+  /// place this backend is strictly better than the interpreter: WasmKit can
+  /// only interrupt a guest that is making WASI calls, so a pure compute loop
+  /// there ignores Ctrl-C. Here the loop dies with the thread it runs on.
+  ///
+  /// The cost is the diff: the memfs went with the worker, so anything the
+  /// guest wrote and had not yet synced is gone. An interrupted command
+  /// leaving nothing behind is the trade for being able to interrupt it.
+  cancel(run) {
+    const state = runs.get(run);
+    if (!state) return;
+    state.cancelled = true;
+    if (state.worker) state.worker.terminate();
+    runs.delete(run);
+  },
+
+  finish(run) {
+    const state = runs.get(run);
+    if (!state) return;
+    if (state.worker) state.worker.terminate();
+    runs.delete(run);
+  },
+};
+
+window.WishWasm = WishWasm;
+
+send({
+  type: 'ready',
+  // Reported rather than assumed, because all three of these are things the
+  // backend would use if it could. `crossOriginIsolated` is expected to be
+  // false — COOP and COEP do not survive a WKURLSchemeHandler document load —
+  // which is why blocking reads go through a synchronous XHR from the worker
+  // instead of `Atomics.wait`. If one of these ever turns true on a future
+  // OS, that is the signal to take the faster path.
+  crossOriginIsolated: self.crossOriginIsolated === true,
+  sharedArrayBuffer: typeof SharedArrayBuffer !== 'undefined',
+  jspi: typeof WebAssembly.Suspending === 'function',
+});
+</script>
+</body>
+</html>
