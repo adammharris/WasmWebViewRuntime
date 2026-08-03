@@ -48,10 +48,25 @@ const FDFLAGS = { APPEND: 1, NONBLOCK: 4 };
 const LOOKUP_SYMLINK_FOLLOW = 1;
 const FSTFLAGS = { ATIM: 1, ATIM_NOW: 2, MTIM: 4, MTIM_NOW: 8 };
 
+/// `eventrwflags`: the readable end of this descriptor has hung up.
+const POLL_HANGUP = 1;
+
 // Every right, on every descriptor. Containment here is the preopen boundary
 // and the host-side path check in `WasmWriteback.apply`, not a rights mask the
 // guest could only ever narrow for itself.
 const ALL_RIGHTS = 0xffffffffffffffffn;
+
+// What a standard stream connected to the terminal reports instead. `isatty`
+// in wasi-libc is exactly this test — a character device with neither
+// `fd_seek` nor `fd_tell` among its rights — and it is what every REPL asks
+// before deciding to print a prompt, echo, or line-buffer its output.
+// Advertising every right made all three of stdin, stdout, and stderr answer
+// "not a terminal", which is how `python` came to read an interactive session
+// as a script. Which streams get this is the host's call, not a guess here:
+// see `WasmStdio.stdinIsTerminal`.
+const FD_SEEK = 1n << 2n;
+const FD_TELL = 1n << 5n;
+const TTY_RIGHTS = ALL_RIGHTS & ~(FD_SEEK | FD_TELL);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder('utf-8', { fatal: false });
@@ -334,16 +349,28 @@ class Sync {
 }
 
 class Stdin {
-  constructor(sync) {
+  constructor(sync, output) {
     this.sync = sync;
+    this.output = output;
     this.buffer = new Uint8Array(0);
     this.offset = 0;
     this.eof = false;
   }
 
+  /// Whether input has ended *and* been drained — what `poll_oneoff` reports
+  /// as a hangup.
+  get ended() { return this.eof && this.offset >= this.buffer.length; }
+
   read(max) {
     if (this.offset >= this.buffer.length) {
       if (this.eof) return new Uint8Array(0);
+      // Everything written so far goes out *before* this thread parks, and
+      // this is the only place it can: nothing in the worker's event loop
+      // runs while the guest is blocked here, so a prompt still sitting in
+      // the 16 ms window would not reach the terminal until the guest wrote
+      // again — which for a REPL is not until after the user has answered a
+      // prompt they cannot see. That is what "the REPL hangs" looks like.
+      this.output.flush();
       const response = this.sync.get('/stdin');
       // Swift answers with zero bytes only at end of input; anything else
       // blocks on its side until there is something to say.
@@ -377,9 +404,10 @@ class WASI {
     // because wasi-libc discovers them by walking upward from fd 3 and this
     // build of it treats the first as the working directory.
     this.fds = new Map();
-    this.fds.set(0, { kind: 'stdin' });
-    this.fds.set(1, { kind: 'stdout' });
-    this.fds.set(2, { kind: 'stderr' });
+    const tty = options.tty || [false, false, false];
+    this.fds.set(0, { kind: 'stdin', tty: tty[0] === true });
+    this.fds.set(1, { kind: 'stdout', tty: tty[1] === true });
+    this.fds.set(2, { kind: 'stderr', tty: tty[2] === true });
     this.trees.forEach((tree, i) => {
       this.fds.set(3 + i, { kind: 'dir', tree, node: tree.root, preopen: tree.guestPath, offset: 0 });
     });
@@ -446,6 +474,20 @@ class WASI {
     view.setBigUint64(ptr + 40, nanos, true);
     view.setBigUint64(ptr + 48, nanos, true);
     view.setBigUint64(ptr + 56, nanos, true);
+  }
+
+  /// The filestat of a standard stream: a character device of no size, which
+  /// is what a host WASI reports for a terminal or a pipe.
+  writeStdioFilestat(ptr) {
+    const view = this.view();
+    view.setBigUint64(ptr, 0n, true);
+    view.setBigUint64(ptr + 8, 0n, true);
+    view.setUint8(ptr + 16, FILETYPE.CHARACTER_DEVICE);
+    view.setBigUint64(ptr + 24, 1n, true);
+    view.setBigUint64(ptr + 32, 0n, true);
+    view.setBigUint64(ptr + 40, 0n, true);
+    view.setBigUint64(ptr + 48, 0n, true);
+    view.setBigUint64(ptr + 56, 0n, true);
   }
 
   guard(entry) {
@@ -635,10 +677,11 @@ class WASI {
         const type = entry.kind === 'dir' ? FILETYPE.DIRECTORY
           : entry.kind === 'file' ? FILETYPE.REGULAR_FILE
             : FILETYPE.CHARACTER_DEVICE;
+        const rights = entry.tty ? TTY_RIGHTS : ALL_RIGHTS;
         v.setUint8(ptr, type);
         v.setUint16(ptr + 2, entry.append ? FDFLAGS.APPEND : 0, true);
-        v.setBigUint64(ptr + 8, ALL_RIGHTS, true);
-        v.setBigUint64(ptr + 16, ALL_RIGHTS, true);
+        v.setBigUint64(ptr + 8, rights, true);
+        v.setBigUint64(ptr + 16, rights, true);
         return E.SUCCESS;
       },
 
@@ -670,7 +713,15 @@ class WASI {
 
       fd_filestat_get(fd, ptr) {
         const entry = self.fd(fd);
-        if (!entry.node) throw new Fail(E.BADF);
+        // A standard stream has no node behind it, and answering EBADF for
+        // one is not "there is nothing to report" — it is "that descriptor is
+        // closed". CPython builds `sys.stdin` from this call and, on failure,
+        // leaves it as `None`, which is why an interactive session used to
+        // read the user's whole input and exit 0 having printed nothing.
+        if (!entry.node) {
+          self.writeStdioFilestat(ptr);
+          return E.SUCCESS;
+        }
         self.writeFilestat(ptr, entry.node);
         return E.SUCCESS;
       },
@@ -941,10 +992,17 @@ class WASI {
             if (nanos > 0n) self.sleep(nanos);
             emitted++;
           } else {
-            // Files are always ready; stdin is ready until it is exhausted,
-            // and reporting it ready at EOF is what lets a reader see the zero
-            // -length read that means end of file.
-            v.setBigUint64(out + 16, 1n, true);
+            // Files are always ready. So is stdin, in the sense that a read of
+            // it will return — either bytes, or the zero-length read that means
+            // end of input. What it must not claim once input has ended is that
+            // a byte is waiting: a reader told "1 byte ready" that then reads 0
+            // has been given no way to tell "nothing yet" from "nothing ever",
+            // and the ones that poll before every read spin on it. `HANGUP` is
+            // the flag that says the far end is gone.
+            const fd = v.getUint32(sub + 16, true);
+            const ended = fd === 0 && self.stdin.ended;
+            v.setBigUint64(out + 16, ended ? 0n : 1n, true);
+            v.setUint16(out + 24, ended ? POLL_HANGUP : 0, true);
             emitted++;
           }
         }
@@ -994,9 +1052,10 @@ async function run(spec) {
     args: [spec.argv0, ...spec.arguments],
     env: spec.environment,
     trees,
-    stdin: new Stdin(sync),
+    stdin: new Stdin(sync, output),
     sync,
     output,
+    tty: spec.tty,
   });
 
   const imports = wasi.imports();

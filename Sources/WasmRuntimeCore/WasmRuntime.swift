@@ -120,9 +120,36 @@ public struct WasmStdio: Sendable {
     /// Bytes to feed the guest's stdin. Finishing the stream is EOF (Ctrl-D).
     public let input: AsyncStream<UInt8>
 
-    public init(onOutput: @escaping @Sendable (Data) -> Void, input: AsyncStream<UInt8>) {
+    /// Whether each of fd 0, 1, and 2 is a terminal rather than a pipe.
+    ///
+    /// This is the answer to `isatty`, and a REPL is a different program
+    /// depending on it: with a terminal it prints a prompt and evaluates a
+    /// line at a time, and without one it reads the whole of stdin as a
+    /// script. The embedder knows which — the shell already tracks it, and
+    /// flips it off for a pipeline stage — and the guest has no other way to
+    /// find out, because on this side of the boundary there is no file
+    /// descriptor to ask.
+    ///
+    /// Only the web view backend can act on it: an in-process interpreter
+    /// hands the guest a real pipe, and a pipe is not a terminal however it is
+    /// described. Defaults to `false`, which is both the honest answer for a
+    /// batch embedder and the one that keeps the two backends agreeing.
+    public let stdinIsTerminal: Bool
+    public let stdoutIsTerminal: Bool
+    public let stderrIsTerminal: Bool
+
+    public init(
+        onOutput: @escaping @Sendable (Data) -> Void,
+        input: AsyncStream<UInt8>,
+        stdinIsTerminal: Bool = false,
+        stdoutIsTerminal: Bool = false,
+        stderrIsTerminal: Bool = false
+    ) {
         self.onOutput = onOutput
         self.input = input
+        self.stdinIsTerminal = stdinIsTerminal
+        self.stdoutIsTerminal = stdoutIsTerminal
+        self.stderrIsTerminal = stderrIsTerminal
     }
 }
 

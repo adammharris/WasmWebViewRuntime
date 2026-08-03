@@ -277,6 +277,9 @@ const WishWasm = {
         argv0: spec.argv0,
         arguments: spec.arguments,
         environment: spec.environment,
+        // Which of fd 0/1/2 the host says is a terminal, which is the whole of
+        // what the guest can learn about it.
+        tty: spec.tty,
         preopens: spec.preopens,
         snapshots: buffers,
         // Where the worker makes its blocking calls — stdin reads and sleeps.

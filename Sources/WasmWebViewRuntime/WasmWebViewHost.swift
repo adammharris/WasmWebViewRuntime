@@ -115,14 +115,16 @@ public final class WasmWebViewHost: NSObject {
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 state.continuation = continuation
-                start(id: id, program: program, preopens: preopens)
+                start(id: id, program: program, preopens: preopens, stdio: stdio)
             }
         } onCancel: {
             Task { @MainActor [weak self] in self?.cancel(id) }
         }
     }
 
-    private func start(id: String, program: WasmProgram, preopens: [WasmPreopen]) {
+    private func start(
+        id: String, program: WasmProgram, preopens: [WasmPreopen], stdio: WasmStdio
+    ) {
         let spec: [String: Any] = [
             "run": id,
             "moduleURL": "\(Self.origin)/run/\(id)/module",
@@ -131,6 +133,10 @@ public final class WasmWebViewHost: NSObject {
             "argv0": program.argv0,
             "arguments": program.arguments,
             "environment": Self.environment,
+            // fd 0, 1, 2. The guest asks `isatty` about each separately, and
+            // the answers genuinely differ: `python | cat` has a terminal on
+            // stdin and a pipe on stdout.
+            "tty": [stdio.stdinIsTerminal, stdio.stdoutIsTerminal, stdio.stderrIsTerminal],
             "preopens": preopens.enumerated().map { index, preopen in
                 [
                     "index": index,
