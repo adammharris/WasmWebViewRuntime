@@ -101,6 +101,10 @@ function makeNode(kind, mode, mtime) {
     data: null,
     size: 0,
     shared: false,
+    // A body the snapshot left on the host. `size` is already right — it came
+    // over with the tree — and `fetch` is how the bytes are got if the guest
+    // ever asks for them. See `materialize`.
+    fetch: null,
     target: null,
     // Set on creation and on every mutation. This is what the sync-back reads,
     // and the reason for not using an off-the-shelf WASI shim.
@@ -135,11 +139,16 @@ class Tree {
   /// Reads a `WSHF` blob. File bodies are `subarray` views rather than copies:
   /// an 18 MB tree costs one buffer, not two, and the copy only happens for
   /// the handful of files the guest actually writes to.
-  load(buffer) {
+  ///
+  /// A body the host left behind arrives as a length with no bytes, and `read`
+  /// is what goes back for them. It takes the path the file had *here*, at load
+  /// time, because that is the only name the host knows it by — a guest that
+  /// renames a file it has not read still gets the right bytes.
+  load(buffer, read) {
     const view = new DataView(buffer);
     const bytes = new Uint8Array(buffer);
     if (view.getUint32(0, false) !== 0x57534846 /* "WSHF" */) throw new Error('bad snapshot magic');
-    if (view.getUint32(4, true) !== 1) throw new Error('bad snapshot version');
+    if (view.getUint32(4, true) !== 2) throw new Error('bad snapshot version');
 
     const count = view.getUint32(8, true);
     let o = 12;
@@ -149,6 +158,7 @@ class Tree {
       const dataLen = view.getUint32(o, true); o += 4;
       const mode = view.getUint32(o, true); o += 4;
       const mtime = view.getFloat64(o, true); o += 8;
+      const size = Number(view.getBigUint64(o, true)); o += 8;
       const path = decoder.decode(bytes.subarray(o, o + pathLen)); o += pathLen;
       const body = bytes.subarray(o, o + dataLen); o += dataLen;
 
@@ -160,9 +170,13 @@ class Tree {
 
       const node = makeNode(kind, mode, mtime);
       if (kind === KIND.FILE) {
-        node.data = body;
-        node.size = dataLen;
-        node.shared = true;
+        node.size = size;
+        if (dataLen < size) {
+          node.fetch = () => read(path);
+        } else {
+          node.data = body;
+          node.shared = true;
+        }
       } else if (kind === KIND.LINK) {
         node.target = decoder.decode(body);
       }
@@ -261,7 +275,32 @@ function touch(node) {
   node.mtime = Date.now() / 1000;
 }
 
+/// Brings in a body the snapshot left on the host.
+///
+/// Every path that needs a file's *bytes* goes through here first, and the ones
+/// that need only its length — `fd_seek` to the end, a `filestat`, a directory
+/// listing — deliberately do not. That asymmetry is the whole point: `ls` in a
+/// 441 MB folder reads a directory and no file at all, and now pays for a
+/// directory.
+///
+/// Blocking, like reading stdin, and by the same mechanism. A failure is an IO
+/// error on the operation that asked, not a dead run — the file went away
+/// underneath us, which is a thing that happens to a folder someone else owns.
+function materialize(node) {
+  if (!node.fetch) return;
+  const buffer = node.fetch();
+  if (!buffer) throw new Fail(E.IO);
+  node.data = new Uint8Array(buffer);
+  node.size = node.data.length;
+  node.shared = false;
+  node.fetch = null;
+}
+
 function writeInto(node, offset, bytes) {
+  // A write has to land on top of what is already there, so the rest of the
+  // file has to be here — even when this write covers all of it, because
+  // nothing says the next one will.
+  materialize(node);
   const end = offset + bytes.length;
   if (node.shared || !node.data || node.data.length < end) {
     const capacity = Math.max(end, (node.data ? node.data.length : 0) * 2, 64);
@@ -615,6 +654,7 @@ class WASI {
           for (let i = 0; i < iovsLen; i++) capacity += v.getUint32(iovs + i * 8 + 4, true);
           read = self.scatter(iovs, iovsLen, self.stdin.read(capacity));
         } else if (entry.kind === 'file') {
+          materialize(entry.node);
           const slice = entry.node.data
             ? entry.node.data.subarray(entry.offset, entry.node.size)
             : new Uint8Array(0);
@@ -630,6 +670,7 @@ class WASI {
       fd_pread(fd, iovs, iovsLen, offset, resultPtr) {
         const entry = self.fd(fd);
         if (entry.kind !== 'file') throw new Fail(E.SPIPE);
+        materialize(entry.node);
         const start = Number(offset);
         const slice = entry.node.data
           ? entry.node.data.subarray(start, entry.node.size)
@@ -732,7 +773,12 @@ class WASI {
         self.guard(entry);
         const next = Number(size);
         if (next > entry.node.size) writeInto(entry.node, entry.node.size, new Uint8Array(next - entry.node.size));
-        else { entry.node.size = next; touch(entry.node); }
+        else {
+          // Truncating keeps the head of the file, so the head has to be here.
+          materialize(entry.node);
+          entry.node.size = next;
+          touch(entry.node);
+        }
         return E.SUCCESS;
       },
 
@@ -826,6 +872,9 @@ class WASI {
           node.size = 0;
           node.data = new Uint8Array(0);
           node.shared = false;
+          // Nothing left to go and get: the bytes on the host are exactly what
+          // the guest just threw away.
+          node.fetch = null;
           touch(node);
         }
 
@@ -952,6 +1001,9 @@ class WASI {
         if (!source.node) throw new Fail(E.NOENT);
         const target = to.tree.resolve(to.node, self.string(newPtr, newLen), false);
         if (target.node) throw new Fail(E.EXIST);
+        // The copy is written back under its own path, so its bytes have to
+        // exist here rather than being fetchable under the original's name.
+        materialize(source.node);
         const copy = makeNode(source.node.kind, source.node.mode, Date.now() / 1000);
         copy.data = source.node.data;
         copy.size = source.node.size;
@@ -1044,7 +1096,13 @@ async function run(spec) {
   const sync = new Sync(spec.syncURL);
   const trees = spec.preopens.map((p, i) => {
     const tree = new Tree(i, p.guestPath, p.readOnly);
-    tree.load(spec.snapshots[i]);
+    tree.load(spec.snapshots[i], (path) => {
+      // Everything written so far goes out before this thread parks, for the
+      // same reason a blocking stdin read flushes: nothing in this worker's
+      // event loop runs while the guest is stopped here.
+      output.flush();
+      return sync.get('/preopen/' + i + '/file?path=' + encodeURIComponent(path));
+    });
     return tree;
   });
 
@@ -1104,12 +1162,21 @@ function pack(changes, deletions) {
   const encoded = changes.map((change) => {
     const path = encoder.encode(change.path);
     const node = change.node;
+    // A file can be dirty without its bytes ever being wanted — `touch` on a
+    // mtime, or a renamed directory marking everything under it. The write-back
+    // sends whole files, so this is where those bodies finally have to arrive.
+    // One that cannot be got is dropped rather than sent empty: the host's copy
+    // is then left alone, which is the harmless outcome. Truncating a file the
+    // guest never touched is not.
+    if (node.kind === KIND.FILE && node.fetch) {
+      try { materialize(node); } catch { return null; }
+    }
     const body = node.kind === KIND.LINK ? encoder.encode(node.target)
       : node.kind === KIND.FILE ? node.data.subarray(0, node.size)
         : new Uint8Array(0);
-    total += 25 + path.length + body.length;
     return { change, path, body };
-  });
+  }).filter(Boolean);
+  for (const { path, body } of encoded) total += 25 + path.length + body.length;
   const encodedDeletions = deletions.map((deletion) => {
     const path = encoder.encode(deletion.path);
     total += 8 + path.length;

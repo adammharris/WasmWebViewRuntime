@@ -397,6 +397,14 @@ extension WasmWebViewHost: WKURLSchemeHandler {
                 fail(task, WasmRuntimeError.trapped("no such preopen"))
                 return
             }
+
+            // `/preopen/<n>/file?path=…` is a body the snapshot left behind,
+            // asked for by a guest that turned out to read it. Blocking, like
+            // `/stdin`: a synchronous XHR is parked on the other end.
+            if components.count > 4, components[4] == "file" {
+                serveFile(in: state.preopens[index], query: query, to: task)
+                return
+            }
             // Packing walks and reads a whole directory tree, which is not
             // something to do on the main thread while a terminal is trying to
             // draw. The guest is blocked on this fetch either way.
@@ -444,6 +452,58 @@ extension WasmWebViewHost: WKURLSchemeHandler {
 
         default:
             fail(task, WasmRuntimeError.trapped("no such run endpoint"))
+        }
+    }
+
+    /// One file out of a preopen, for a guest reading a body the snapshot did
+    /// not carry.
+    ///
+    /// The path was last touched by guest code, so it goes through `GuestPath`
+    /// against the preopen root — the same component-array rule a write-back
+    /// gets, and for the same reason: `../../bin/coreutils.wasm` has to name
+    /// something inside the preopen or nothing at all. Nothing new is reachable
+    /// either way, because the snapshot already told the guest this tree exists;
+    /// what this endpoint decides is only whether the bytes arrive now or did
+    /// earlier.
+    private func serveFile(
+        in preopen: WasmPreopen, query: String?, to task: any WKURLSchemeTask
+    ) {
+        let raw = query?
+            .split(separator: "&")
+            .first { $0.hasPrefix("path=") }
+            .map { String($0.dropFirst("path=".count)) }
+        guard let path = raw?.removingPercentEncoding else {
+            fail(task, WasmRuntimeError.trapped("no such file in the preopen"))
+            return
+        }
+        let components = GuestPath.components(of: path, relativeTo: [], home: [])
+        guard !components.isEmpty else {
+            fail(task, WasmRuntimeError.trapped("no such file in the preopen"))
+            return
+        }
+        let url = GuestPath.url(for: components, root: preopen.hostURL)
+
+        // Off the main actor for the same reason packing is: this is file IO
+        // proportional to what the guest asked for, and the terminal is still
+        // drawing. The guest is blocked on the request either way.
+        let ticket = nextTicket
+        nextTicket += 1
+        deferred[ticket] = task
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let data = try? Data(contentsOf: url, options: .mappedIfSafe)
+            await self?.completeFile(ticket: ticket, data: data, path: path)
+        }
+    }
+
+    /// Answers the parked request. A file that cannot be read fails the request
+    /// rather than the run — the guest turns that into an IO error on the read,
+    /// which is what a guest asking for a file that went away should see.
+    private func completeFile(ticket: Int, data: Data?, path: String) {
+        guard let task = deferred.removeValue(forKey: ticket) else { return }
+        if let data {
+            respond(to: task, data: data, mimeType: "application/octet-stream")
+        } else {
+            fail(task, WasmRuntimeError.trapped("could not read \(path)"))
         }
     }
 

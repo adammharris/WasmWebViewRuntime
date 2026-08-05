@@ -40,15 +40,25 @@ public struct WasmPreopen: Sendable {
 ///
 /// ```
 /// "WSHF" u32 version u32 entryCount
-/// entry: u8 kind, u32 pathLen, u32 dataLen, u32 mode, f64 mtime, path…, data…
+/// entry: u8 kind, u32 pathLen, u32 dataLen, u32 mode, f64 mtime, u64 size,
+///        path…, data…
 /// ```
+///
+/// `dataLen` is how many bytes travel with the entry and `size` is how long the
+/// file actually is. They are equal for a file the snapshot carries; a file
+/// whose body stayed on the host has `dataLen` of zero and a real `size`, and
+/// the guest fetches the bytes if it ever reads them. See
+/// ``carriedBody(size:treeSize:)`` for which files those are — the whole reason
+/// the distinction exists is that
+/// `ls` in a 441 MB folder reads a few kilobytes of directory and nothing else,
+/// and was paying for the other 441 MB.
 ///
 /// Paths are relative to the preopen root, `/`-separated, with no leading
 /// slash, and sorted — which puts every parent ahead of its children, so the
 /// reader can build the tree in one pass without ever looking a parent up.
 public enum WasmSnapshot {
     public static let magic: [UInt8] = Array("WSHF".utf8)
-    public static let version: UInt32 = 1
+    public static let version: UInt32 = 2
 
     public enum Kind: UInt8 {
         case directory = 0
@@ -56,15 +66,38 @@ public enum WasmSnapshot {
         case symlink = 2
     }
 
-    /// What a single preopen is allowed to weigh.
+    /// A tree this size or smaller crosses whole.
     ///
-    /// Copying is the whole cost model of this backend, and the failure it
-    /// guards against is not slowness but the jetsam killing the app: the
-    /// bytes exist twice at the peak, once in `Data` and once in the web
-    /// content process. A tree over the limit is a clear error at the top of
-    /// the run rather than a crash somewhere in the middle of it.
+    /// Copying is the whole cost model of this backend, and for a tree that
+    /// fits, copying it up front is the cheapest thing available: one transfer
+    /// instead of a round trip per file. Every installed package is this shape
+    /// — an 18 MB standard library, a 45 MB build cache — and this is the size
+    /// the backend was measured at.
+    public static let eagerByteLimit = 64 << 20
+
+    /// Above that, the size a file has to be under to travel unasked.
+    ///
+    /// A big tree is one nobody reads all of, so its bodies stay on the host
+    /// and are fetched on demand. Small files are the exception: a source tree
+    /// is thousands of them, a round trip each would cost more than the bytes,
+    /// and carrying one costs almost nothing.
+    public static let inlineFileLimit = 64 << 10
+
+    /// What a single preopen may carry, however small its files are.
+    ///
+    /// The bytes exist twice at the peak, once in `Data` and once in the web
+    /// content process, and this is what keeps that peak away from the jetsam
+    /// limit. Nothing is lost by hitting it any more — bodies over the line
+    /// stay on the host, where the guest can still ask for them.
     public static let byteLimit = 192 << 20
+
     public static let entryLimit = 200_000
+
+    /// Whether a file of this size travels with the snapshot, given what the
+    /// whole tree weighs.
+    public static func carriedBody(size: Int, treeSize: Int) -> Bool {
+        treeSize <= eagerByteLimit || size <= inlineFileLimit
+    }
 
     /// Reads a host directory into a snapshot.
     ///
@@ -85,6 +118,9 @@ public enum WasmSnapshot {
             guard let data = try? Data(contentsOf: file.hostURL, options: .mappedIfSafe) else {
                 continue
             }
+            // An overlay always travels. It is a package file rather than
+            // something in the directory, so there is no path under the
+            // preopen the guest could later name to ask for it.
             let components = file.guestPath.split(separator: "/").map(String.init)
             guard !components.isEmpty else { continue }
 
@@ -98,7 +134,7 @@ public enum WasmSnapshot {
                       !entries.contains(where: { $0.path == path })
                 else { continue }
                 entries.append(
-                    Entry(path: path, kind: .directory, mode: 0o755, mtime: 0, data: Data()))
+                    Entry(path: path, kind: .directory, mode: 0o755, mtime: 0, size: 0))
             }
 
             let path = components.joined(separator: "/")
@@ -106,33 +142,55 @@ public enum WasmSnapshot {
             // user put there, whatever it declared.
             guard !entries.contains(where: { $0.path == path }) else { continue }
             entries.append(
-                Entry(path: path, kind: .file, mode: 0o644, mtime: 0, data: data))
+                Entry(
+                    path: path, kind: .file, mode: 0o644, mtime: 0, size: data.count,
+                    body: data))
         }
 
         entries.sort { $0.path < $1.path }
 
         var total = 0
-        for entry in entries { total += entry.data.count }
-        guard total <= byteLimit else {
-            throw WasmRuntimeError.trapped(
-                "\(root.lastPathComponent): \(total >> 20) MB is too much to copy into the "
-                    + "web view (limit \(byteLimit >> 20) MB) — use the interpreter backend"
-            )
+        for entry in entries { total += entry.size }
+
+        // Reading happens here rather than in the walk so that a body nobody
+        // is going to carry is never mapped at all. A tree of a hundred
+        // thousand files is a hundred thousand mappings otherwise, for the
+        // handful of them that end up in the buffer.
+        var bodies: [Int: Data] = [:]
+        var carried = 0
+        for (index, entry) in entries.enumerated() {
+            guard entry.kind == .file, entry.body == nil else { continue }
+            guard carriedBody(size: entry.size, treeSize: total),
+                  carried + entry.size <= byteLimit
+            else { continue }
+            guard let data = try? Data(contentsOf: entry.url(under: root), options: .mappedIfSafe)
+            else { continue }
+            bodies[index] = data
+            carried += data.count
         }
 
-        var out = Data(capacity: total + entries.count * 32 + 12)
+        var out = Data(capacity: carried + entries.count * 40 + 12)
         out.append(contentsOf: magic)
         out.appendLittle(version)
         out.appendLittle(UInt32(entries.count))
-        for entry in entries {
+        for (index, entry) in entries.enumerated() {
             let path = Array(entry.path.utf8)
+            // A body that stayed behind still reports its real length: `ls -l`
+            // and `stat` are answered out of the tree, and only a read of the
+            // bytes themselves has to cross back. One that travelled reports
+            // what actually travelled, so that a file which changed size
+            // between the `lstat` and the read cannot arrive describing itself
+            // as something it is not.
+            let body = entry.body ?? bodies[index]
+            let size = body?.count ?? entry.size
             out.append(entry.kind.rawValue)
             out.appendLittle(UInt32(path.count))
-            out.appendLittle(UInt32(entry.data.count))
+            out.appendLittle(UInt32(body?.count ?? 0))
             out.appendLittle(entry.mode)
             out.appendLittle(entry.mtime.bitPattern)
+            out.appendLittle(UInt64(size))
             out.append(contentsOf: path)
-            out.append(entry.data)
+            if let body { out.append(body) }
         }
         return out
     }
@@ -142,7 +200,17 @@ public enum WasmSnapshot {
         let kind: Kind
         let mode: UInt32
         let mtime: Double
-        let data: Data
+        /// How long the file is, whether or not its bytes travel.
+        let size: Int
+        /// Bytes that belong to the entry itself rather than to a file on
+        /// disk: a symlink's target, and an overlay's contents. `nil` for an
+        /// ordinary file, whose body is read later if it is carried at all.
+        var body: Data?
+
+        /// Where the bytes are, for a file the snapshot decided to carry.
+        func url(under root: URL) -> URL {
+            URL(filePath: root.path + "/" + path)
+        }
     }
 
     private static func walk(root: String, relative: String, into entries: inout [Entry]) throws {
@@ -171,7 +239,7 @@ public enum WasmSnapshot {
             switch info.st_mode & S_IFMT {
             case S_IFDIR:
                 entries.append(
-                    Entry(path: path, kind: .directory, mode: mode, mtime: mtime, data: Data()))
+                    Entry(path: path, kind: .directory, mode: mode, mtime: mtime, size: 0))
                 try walk(root: root, relative: path, into: &entries)
 
             case S_IFLNK:
@@ -179,19 +247,20 @@ public enum WasmSnapshot {
                 // own path walk, so a link pointing outside the preopen simply
                 // fails to resolve there — the same thing WASI does.
                 let target = (try? FileManager.default.destinationOfSymbolicLink(atPath: full)) ?? ""
+                let body = Data(target.utf8)
                 entries.append(
                     Entry(
                         path: path, kind: .symlink, mode: mode, mtime: mtime,
-                        data: Data(target.utf8)))
+                        size: body.count, body: body))
 
             case S_IFREG:
-                // Mapped rather than read: a module the guest never opens
-                // costs address space instead of resident memory, and the
-                // pages that do get touched are the ones being copied out.
-                let data =
-                    (try? Data(contentsOf: URL(filePath: full), options: .mappedIfSafe)) ?? Data()
+                // The size `lstat` already answered is all this needs: whether
+                // the bytes travel is decided once the whole tree is known,
+                // and reading one that stays behind would be work thrown away.
                 entries.append(
-                    Entry(path: path, kind: .file, mode: mode, mtime: mtime, data: data))
+                    Entry(
+                        path: path, kind: .file, mode: mode, mtime: mtime,
+                        size: Int(info.st_size)))
 
             default:
                 // Sockets, fifos, devices. Nothing the sandbox produces, and
