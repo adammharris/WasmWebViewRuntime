@@ -5,9 +5,9 @@ import WasmWebViewRuntime
 
 /// Runs `Fixtures/guest.wasm` on the web view backend for real.
 ///
-/// On macOS this needs no window: a detached `WKWebView` keeps its web content
-/// process there, which is the property these tests lean on. On iOS they need
-/// a host app with the view attached; see `WasmWebViewCanvas`.
+/// No window on either platform. macOS runs a detached `WKWebView` at full
+/// speed; the iOS simulator runs it too, but throttled to seconds a run,
+/// because nothing has attached it — which is what `WasmWebViewCanvas` is for.
 @MainActor
 @Suite(.serialized)
 struct WasmWebViewHostTests {

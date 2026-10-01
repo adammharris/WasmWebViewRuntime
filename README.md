@@ -116,9 +116,10 @@ swift test
 ```
 
 runs a real guest (`Tests/WasmWebViewRuntimeTests/Fixtures/guest.rs`) on
-macOS. A detached `WKWebView` keeps its web content process there, so the
-tests need no window. On iOS the same suite needs a host app with the view
-attached.
+macOS, with no window. The same suite passes on the iOS simulator through
+`xcodebuild test -scheme WasmWebViewRuntime-Package`, but a run there takes
+0.6–6 s against about 4 ms on the Mac: the view is detached and invisible,
+and WebKit throttles it. That is what `hostingWasmWebView` is for in an app.
 
 ## License
 
