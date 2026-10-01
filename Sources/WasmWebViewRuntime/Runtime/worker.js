@@ -364,11 +364,29 @@ class Output {
 /// document's main thread and permitted in a worker — including `responseType`,
 /// which only the Window case rejects — and it suspends this thread until Swift
 /// answers the request. So the host does not have to pre-drain stdin, which
-/// matters more than it sounds: `ShellEngine` holds the foreground job's stdin
-/// open for the life of the command, so waiting for EOF before starting would
+/// matters more than it sounds: a shell holds the foreground job's stdin open
+/// for the life of the command, so waiting for EOF before starting would
 /// deadlock every command that does not read stdin at all.
 class Sync {
   constructor(base) { this.base = base; }
+
+  /// Sends `body` and returns `{ ok, bytes }`, or null if the request did not
+  /// complete. `ok` is false when Swift answered with an error, in which case
+  /// `bytes` is its message — a host function that threw, not a broken
+  /// channel.
+  post(path, body) {
+    try {
+      const request = new XMLHttpRequest();
+      request.open('POST', this.base + path, false);
+      request.responseType = 'arraybuffer';
+      request.send(body);
+      if (request.status === 200) return { ok: true, bytes: new Uint8Array(request.response) };
+      if (request.status === 500) return { ok: false, bytes: new Uint8Array(request.response) };
+      return null;
+    } catch (error) {
+      return null;
+    }
+  }
 
   /// Returns an ArrayBuffer, or null if the request failed. A failure is not
   /// fatal — the caller treats it as end-of-input, which degrades an
@@ -423,6 +441,66 @@ class Stdin {
     const slice = this.buffer.subarray(this.offset, Math.min(this.offset + max, this.buffer.length));
     this.offset += slice.length;
     return slice;
+  }
+}
+
+// MARK: - Host modules
+
+/// The embedder's functions, as WebAssembly imports.
+///
+/// Every function has the same shape, `(ptr, len) -> i32`, and every reply is
+/// collected through `wasm_host.take_reply` — see `WasmHostModule` on the Swift
+/// side, which is where the convention is written down for embedders. The
+/// reply is held here between the two calls, so a function with side effects
+/// runs exactly once however the guest sizes its buffer.
+class HostModules {
+  constructor(modules, sync, output, memory) {
+    this.modules = modules || [];
+    this.sync = sync;
+    this.output = output;
+    this.memory = memory;
+    this.reply = new Uint8Array(0);
+  }
+
+  bytes() { return new Uint8Array(this.memory().buffer); }
+
+  call(module, name, ptr, len) {
+    // The request is copied out: guest memory can grow — and its buffer be
+    // detached — while the guest is parked, and the XHR owns what it sends.
+    const request = this.bytes().slice(ptr, ptr + len);
+    // Output first, for the reason a blocking stdin read flushes: nothing in
+    // this worker runs while the guest waits, and a log line written just
+    // before a slow call should not appear only after it.
+    this.output.flush();
+    const answer = this.sync.post(
+      '/host/' + encodeURIComponent(module) + '/' + encodeURIComponent(name), request);
+    if (!answer) {
+      this.reply = encoder.encode(`${module}.${name}: the host did not answer`);
+      return -(this.reply.length + 1);
+    }
+    this.reply = answer.bytes;
+    return answer.ok ? this.reply.length : -(this.reply.length + 1);
+  }
+
+  takeReply(ptr, capacity) {
+    const length = Math.min(capacity, this.reply.length);
+    this.bytes().set(this.reply.subarray(0, length), ptr);
+    this.reply = new Uint8Array(0);
+    return length;
+  }
+
+  /// The import object entries: one per embedder module, plus `wasm_host`.
+  imports() {
+    const table = {};
+    for (const module of this.modules) {
+      const functions = {};
+      for (const name of module.functions) {
+        functions[name] = (ptr, len) => this.call(module.name, name, ptr, len);
+      }
+      table[module.name] = functions;
+    }
+    table.wasm_host = { take_reply: (ptr, capacity) => this.takeReply(ptr, capacity) };
+    return table;
   }
 }
 
@@ -1117,7 +1195,11 @@ async function run(spec) {
   });
 
   const imports = wasi.imports();
+  const host = new HostModules(spec.hostModules, sync, output, () => wasi.memory);
   const instance = await WebAssembly.instantiate(spec.module, {
+    // First, so a host module can never stand in for WASI — the Swift side
+    // refuses those names as well.
+    ...host.imports(),
     wasi_snapshot_preview1: imports,
     // Some toolchains emit the older module name. Same table either way.
     wasi_unstable: imports,

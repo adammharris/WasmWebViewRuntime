@@ -1,13 +1,13 @@
 // swift-tools-version:6.2
 import PackageDescription
 
-// The JIT backend, split out of the app.
+// Runs WebAssembly on WebKit's JIT, in the WebContent process, from an app
+// that is not itself allowed to JIT.
 //
-// Not because a second consumer exists — there isn't one — but because the
-// boundary was being held by discipline rather than by the compiler. Everything
-// in here had to stay ignorant of packages, manifests, the shell's namespace
-// and the terminal, and nothing but care was stopping `BinManifest` from
-// appearing in a signature. Now the module graph stops it.
+// Split out of Wish (github.com/adammharris/wish), first into a local package
+// so the module graph held a boundary that had been held by discipline, then
+// into this repository when a second embedder arrived. Everything in here
+// stays ignorant of what its embedder is: a shell, a journal, anything else.
 //
 // Two targets, because the layering is real:
 //
@@ -19,7 +19,7 @@ import PackageDescription
 //   WasmWebViewRuntime  the web view, the page, the worker, and the snapshot
 //                       format that crosses between them.
 //
-// The interpreter is deliberately *not* here. It is 450 lines of WasmKit and
+// The interpreter is deliberately *not* here (Wish keeps its WasmKit one). It is 450 lines of WasmKit and
 // SystemPackage glue with no relationship to any of this beyond implementing
 // the same protocol, and pulling it in would make a package about web views
 // depend on a WebAssembly engine.
@@ -28,8 +28,12 @@ let package = Package(
     platforms: [
         // iOS 16 is where the web content process of an unattached WKWebView
         // started being terminated, which is the constraint `WasmWebViewCanvas`
-        // exists to satisfy. The app targets 18 for unrelated reasons.
-        .iOS(.v18)
+        // exists to satisfy. 18 is what Wish targeted when this was split
+        // out; nothing here has been tried lower.
+        .iOS(.v18),
+        // macOS runs a detached web view, so the canvas is optional there.
+        // 14 is the release paired with iOS 17's WebKit; untried lower.
+        .macOS(.v14),
     ],
     products: [
         .library(name: "WasmRuntimeCore", targets: ["WasmRuntimeCore"]),
@@ -60,6 +64,14 @@ let package = Package(
                 // whatsoever about the actual problem.
                 .copy("Runtime")
             ],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "WasmWebViewRuntimeTests",
+            dependencies: ["WasmRuntimeCore", "WasmWebViewRuntime"],
+            // `guest.wasm` is built from `guest.rs`; see the comment at its top.
+            exclude: ["Fixtures/guest.rs"],
+            resources: [.copy("Fixtures/guest.wasm")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

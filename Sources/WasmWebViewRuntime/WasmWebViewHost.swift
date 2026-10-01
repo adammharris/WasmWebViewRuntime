@@ -20,7 +20,8 @@ import WebKit
 /// - **Blocking, guest to host** goes over the same scheme handler, hit by a
 ///   *synchronous* `XMLHttpRequest` from the worker. This is what makes WASI's
 ///   synchronous `fd_read` work without `SharedArrayBuffer`, which a WKWebView
-///   cannot have. See `wish-worker.js`.
+///   cannot have. Stdin, sleeps, file bodies left on the host, and calls to
+///   the embedder's host modules all ride this. See `worker.js`.
 /// - **Everything else** is `WKScriptMessageHandler` — output, exit status, and
 ///   the filesystem diff, base64'd because a script message body is JSON.
 @MainActor
@@ -28,15 +29,19 @@ public final class WasmWebViewHost: NSObject {
     /// The scheme the runtime page and all its traffic live on. Must not be a
     /// scheme WebKit already knows, and the page itself has to be loaded from
     /// it — a document on `file://` cannot fetch from a custom scheme.
-    private static let scheme = "wish-wasm"
-    private static let origin = "wish-wasm://runtime"
+    private static let scheme = "wasm-webview"
+    private static let origin = "wasm-webview://runtime"
 
-    /// The view has to be in the view hierarchy.
+    /// The script message handler the page posts to.
+    private static let bridge = "wasmWebView"
+
+    /// On iOS the view has to be in the view hierarchy.
     ///
     /// iOS 16 and later terminate the web content process of a `WKWebView`
     /// that is not in a window, and throttle JavaScript in one that is not
     /// visible. Hidden-but-attached is the arrangement that survives; see
-    /// `WasmWebViewCanvas` for the zero-sized view that does the attaching.
+    /// `WasmWebViewCanvas` for the one-point view that does the attaching.
+    /// macOS runs a detached view, so there the canvas is optional.
     public private(set) lazy var view: WKWebView = makeWebView()
 
     /// Nothing to configure. Every knob this backend has is per-run and
@@ -78,6 +83,7 @@ public final class WasmWebViewHost: NSObject {
     // MARK: - Running
 
     public func run(_ program: WasmProgram, stdio: WasmStdio) async throws -> Int32 {
+        let hostModules = try Self.validate(program.hostModules)
         try await ensureReady()
 
         let moduleData = try Self.moduleData(at: program.moduleURL)
@@ -89,6 +95,7 @@ public final class WasmWebViewHost: NSObject {
             preopens: preopens,
             overlay: program.overlay,
             moduleData: moduleData,
+            hostModules: hostModules,
             onOutput: stdio.onOutput
         )
         runs[id] = state
@@ -132,7 +139,12 @@ public final class WasmWebViewHost: NSObject {
             "syncURL": "\(Self.origin)/run/\(id)",
             "argv0": program.argv0,
             "arguments": program.arguments,
-            "environment": Self.environment,
+            "environment": program.environment,
+            // Names only. The functions stay here, and the worker reaches
+            // them by path: `/run/<id>/host/<module>/<function>`.
+            "hostModules": program.hostModules.map { module in
+                ["name": module.name, "functions": module.functions.map(\.name)]
+            },
             // fd 0, 1, 2. The guest asks `isatty` about each separately, and
             // the answers genuinely differ: `python | cat` has a terminal on
             // stdin and a pipe on stdout.
@@ -164,7 +176,7 @@ public final class WasmWebViewHost: NSObject {
         // rather than ignoring the value. The trailing `void 0` is what makes
         // this fire-and-forget; the run reports itself through the message
         // handler, not through here.
-        view.evaluateJavaScript("WishWasm.start(\(text)); void 0;") { [weak self] _, error in
+        view.evaluateJavaScript("WasmWebView.start(\(text)); void 0;") { [weak self] _, error in
             guard let error else { return }
             MainActor.assumeIsolated {
                 self?.finish(
@@ -177,7 +189,7 @@ public final class WasmWebViewHost: NSObject {
 
     private func cancel(_ id: String) {
         guard runs[id] != nil else { return }
-        view.evaluateJavaScript("WishWasm.cancel('\(id)'); void 0;")
+        view.evaluateJavaScript("WasmWebView.cancel('\(id)'); void 0;")
         finish(id, with: .failure(CancellationError()))
     }
 
@@ -220,7 +232,7 @@ public final class WasmWebViewHost: NSObject {
         case .idle:
             readiness = .loading([])
             _ = view
-            guard Self.resource("wish-runtime", "html") != nil,
+            guard Self.resource("runtime", "html") != nil,
                   let page = URL(string: "\(Self.origin)/index.html")
             else {
                 readiness = .idle
@@ -269,17 +281,19 @@ public final class WasmWebViewHost: NSObject {
     private func makeWebView() -> WKWebView {
         let configuration = WKWebViewConfiguration()
         configuration.setURLSchemeHandler(self, forURLScheme: Self.scheme)
-        configuration.userContentController.add(self, name: "wish")
+        configuration.userContentController.add(self, name: Self.bridge)
         // Nothing here is a document the user reads, and a run that outlives
         // the app's foreground is a run that was going to be killed anyway.
         configuration.suppressesIncrementalRendering = true
 
         let view = WKWebView(frame: .zero, configuration: configuration)
         view.navigationDelegate = self
+        #if canImport(UIKit)
         view.isUserInteractionEnabled = false
         view.isOpaque = false
         view.backgroundColor = .clear
         // Deliberately not `isHidden`: see `WasmWebViewCanvas`.
+        #endif
         return view
     }
 
@@ -317,18 +331,42 @@ public final class WasmWebViewHost: NSObject {
         return String(UInt(bitPattern: hasher.finalize()), radix: 36)
     }
 
-    /// Matches the interpreter backend's environment exactly. A guest that
-    /// behaves differently between backends because of `$TERM` would be a bug
-    /// nobody would think to look for here — `WasmBackendParityTests` is what
-    /// keeps the two lists honest now that they are in different modules.
-    private static let environment: [String: String] = [
-        "HOME": "/",
-        "PWD": "/",
-        "PATH": "/",
-        "TERM": "xterm-ghostty",
-        "TERM_PROGRAM": "Wish",
-        "LANG": "en_US.UTF-8",
-    ]
+    /// Indexes the program's host modules by name, refusing what the guest
+    /// could not reach or could reach two ways.
+    ///
+    /// Checked before anything loads, because a mistake here is the
+    /// embedder's and should read as one, not as a link error out of the
+    /// worker about an import the guest was never going to find.
+    private static func validate(
+        _ modules: [WasmHostModule]
+    ) throws -> [String: [String: WasmHostFunction]] {
+        var index: [String: [String: WasmHostFunction]] = [:]
+        for module in modules {
+            guard !module.name.isEmpty, !module.name.contains("/") else {
+                throw WasmRuntimeError.invalidHostModule("\"\(module.name)\" is not a usable name")
+            }
+            guard !WasmHostModule.reservedNames.contains(module.name) else {
+                throw WasmRuntimeError.invalidHostModule("\"\(module.name)\" is reserved")
+            }
+            guard index[module.name] == nil else {
+                throw WasmRuntimeError.invalidHostModule("\"\(module.name)\" is declared twice")
+            }
+            var functions: [String: WasmHostFunction] = [:]
+            for function in module.functions {
+                guard !function.name.isEmpty, !function.name.contains("/") else {
+                    throw WasmRuntimeError.invalidHostModule(
+                        "\(module.name).\"\(function.name)\" is not a usable name")
+                }
+                guard functions[function.name] == nil else {
+                    throw WasmRuntimeError.invalidHostModule(
+                        "\(module.name).\(function.name) is declared twice")
+                }
+                functions[function.name] = function
+            }
+            index[module.name] = functions
+        }
+        return index
+    }
 }
 
 // MARK: - Serving the runtime and its payloads
@@ -345,10 +383,10 @@ extension WasmWebViewHost: WKURLSchemeHandler {
 
         switch components.first {
         case "index.html", nil:
-            serveResource("wish-runtime", "html", "text/html", to: task)
+            serveResource("runtime", "html", "text/html", to: task)
 
         case "worker.js":
-            serveResource("wish-worker", "js", "text/javascript", to: task)
+            serveResource("worker", "js", "text/javascript", to: task)
 
         case "run":
             serveRun(components: components, query: task.request.url?.query, to: task)
@@ -378,7 +416,8 @@ extension WasmWebViewHost: WKURLSchemeHandler {
         respond(to: task, data: data, mimeType: mimeType)
     }
 
-    /// `/run/<id>/module`, `/preopen/<n>`, `/stdin`, and `/sleep`.
+    /// `/run/<id>/module`, `/preopen/<n>`, `/stdin`, `/sleep`, and
+    /// `/host/<module>/<function>`.
     private func serveRun(components: [String], query: String?, to task: any WKURLSchemeTask) {
         guard components.count >= 3, let state = runs[components[1]] else {
             fail(task, WasmRuntimeError.trapped("no such run"))
@@ -450,8 +489,57 @@ extension WasmWebViewHost: WKURLSchemeHandler {
                 self?.respond(to: task, data: Data(), mimeType: "application/octet-stream")
             }
 
+        case "host":
+            serveHostCall(components: components, state: state, to: task)
+
         default:
             fail(task, WasmRuntimeError.trapped("no such run endpoint"))
+        }
+    }
+
+    /// One call from the guest into an embedder's host module.
+    ///
+    /// Blocking, like `/stdin`: the guest is parked in a synchronous XHR until
+    /// this answers. The request body is the guest's bytes. A reply is a 200
+    /// with the function's bytes; a throw is a 500 with its description, which
+    /// the worker hands the guest as an error rather than ending the run — a
+    /// failed call is something the guest asked about and can handle.
+    ///
+    /// The function runs off the main actor, reached by ticket for the same
+    /// reason packing is: `WKURLSchemeTask` is not `Sendable`.
+    private func serveHostCall(
+        components: [String], state: RunState, to task: any WKURLSchemeTask
+    ) {
+        guard components.count == 5,
+              let function = state.hostModules[components[3]]?[components[4]]
+        else {
+            fail(task, WasmRuntimeError.trapped("no such host function"))
+            return
+        }
+        let request = task.request.httpBody ?? Data()
+        let ticket = nextTicket
+        nextTicket += 1
+        deferred[ticket] = task
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let result: Result<Data, any Error>
+            do {
+                result = .success(try await function.call(request))
+            } catch {
+                result = .failure(error)
+            }
+            await self?.completeHostCall(ticket: ticket, result: result)
+        }
+    }
+
+    private func completeHostCall(ticket: Int, result: Result<Data, any Error>) {
+        guard let task = deferred.removeValue(forKey: ticket) else { return }
+        switch result {
+        case let .success(data):
+            respond(to: task, data: data, mimeType: "application/octet-stream")
+        case let .failure(error):
+            respond(
+                to: task, data: Data(error.localizedDescription.utf8),
+                mimeType: "text/plain; charset=utf-8", status: 500)
         }
     }
 
@@ -523,11 +611,13 @@ extension WasmWebViewHost: WKURLSchemeHandler {
     /// Every reply funnels through here because a `WKURLSchemeTask` that has
     /// already been stopped raises an Objective-C exception when written to,
     /// and an exception through Swift frames is not catchable — it is a crash.
-    fileprivate func respond(to task: any WKURLSchemeTask, data: Data, mimeType: String) {
+    fileprivate func respond(
+        to task: any WKURLSchemeTask, data: Data, mimeType: String, status: Int = 200
+    ) {
         guard activeTasks.remove(ObjectIdentifier(task)) != nil else { return }
         let response = HTTPURLResponse(
             url: task.request.url ?? URL(string: Self.origin)!,
-            statusCode: 200,
+            statusCode: status,
             httpVersion: "HTTP/1.1",
             headerFields: [
                 "Content-Type": mimeType,
@@ -544,7 +634,7 @@ extension WasmWebViewHost: WKURLSchemeHandler {
                 // worker, and every snapshot fail with "Load failed".
                 //
                 // Blocking reads go through a synchronous XHR instead, so
-                // there is nothing left to gain by asking. See `wish-worker.js`.
+                // there is nothing left to gain by asking. See `worker.js`.
                 "Cross-Origin-Resource-Policy": "cross-origin",
             ]
         )!
@@ -646,11 +736,11 @@ extension WasmWebViewHost: WKScriptMessageHandler {
                     // possible outcome for a backend whose whole job is
                     // moving files.
                     for problem in problems.prefix(10) {
-                        onOutput(Data("wish: could not write back \(problem)\r\n".utf8))
+                        onOutput(Data("could not write back \(problem)\r\n".utf8))
                     }
                 } catch {
                     onOutput(
-                        Data("wish: \(error.localizedDescription)\r\n".utf8))
+                        Data("could not write back: \(error.localizedDescription)\r\n".utf8))
                 }
             }
             state.resume(.success(status))
@@ -666,7 +756,7 @@ extension WasmWebViewHost: WKNavigationDelegate {
     /// takes the page down with it, and every run has to be told.
     public func webViewWebContentProcessDidTerminate(_: WKWebView) {
         let error = WasmRuntimeError.trapped(
-            "the web view ran out of memory — try the interpreter backend")
+            "the web view's content process ended, most likely out of memory")
         // `Array` because `finish` removes from `runs`, and mutating a
         // dictionary while walking its keys view is not a thing to do.
         for id in Array(runs.keys) { finish(id, with: .failure(error)) }
@@ -699,6 +789,7 @@ private final class RunState {
     let preopens: [WasmPreopen]
     let overlay: [WasmOverlay]
     let moduleData: Data
+    let hostModules: [String: [String: WasmHostFunction]]
     let onOutput: @Sendable (Data) -> Void
     let stdin = StdinBuffer()
 
@@ -712,11 +803,13 @@ private final class RunState {
         preopens: [WasmPreopen],
         overlay: [WasmOverlay],
         moduleData: Data,
+        hostModules: [String: [String: WasmHostFunction]],
         onOutput: @escaping @Sendable (Data) -> Void
     ) {
         self.preopens = preopens
         self.overlay = overlay
         self.moduleData = moduleData
+        self.hostModules = hostModules
         self.onOutput = onOutput
     }
 

@@ -83,6 +83,21 @@ public struct WasmProgram: Sendable {
     /// Files the guest finds in its working directory that are not on disk.
     public let overlay: [WasmOverlay]
 
+    /// The guest's environment variables.
+    ///
+    /// Belongs to the program rather than to either backend, because a guest
+    /// that behaves differently between engines over `$TERM` is a bug nobody
+    /// would think to look for there. The embedder decides what a guest sees;
+    /// ``defaultEnvironment`` is only what it gets when nobody says.
+    public let environment: [String: String]
+
+    /// Functions the embedder offers the guest, grouped by import module.
+    ///
+    /// The guest declares them as imports and calls them synchronously; see
+    /// ``WasmHostModule`` for the calling convention. An engine that cannot
+    /// offer them refuses the program rather than running it without.
+    public let hostModules: [WasmHostModule]
+
     /// The engine this program must run on, whatever the user selected.
     ///
     /// For the cases where the choice is not a preference: a module built
@@ -100,6 +115,8 @@ public struct WasmProgram: Sendable {
         root: URL,
         mounts: [WasmMount] = [],
         overlay: [WasmOverlay] = [],
+        environment: [String: String] = WasmProgram.defaultEnvironment,
+        hostModules: [WasmHostModule] = [],
         requiredBackend: WasmBackend? = nil
     ) {
         self.moduleURL = moduleURL
@@ -108,7 +125,86 @@ public struct WasmProgram: Sendable {
         self.root = root
         self.mounts = mounts
         self.overlay = overlay
+        self.environment = environment
+        self.hostModules = hostModules
         self.requiredBackend = requiredBackend
+    }
+
+    /// What a guest sees when the embedder names no environment: a home, a
+    /// working directory and a path that are all the guest's `/`, and a UTF-8
+    /// locale. No `TERM` — whether there is a terminal, and which, is the
+    /// embedder's to say.
+    public static let defaultEnvironment: [String: String] = [
+        "HOME": "/",
+        "PWD": "/",
+        "PATH": "/",
+        "LANG": "en_US.UTF-8",
+    ]
+}
+
+/// One function the embedder offers a guest.
+///
+/// Bytes in, bytes out. What the bytes mean — JSON, a fixed struct, a path —
+/// is a contract between the embedder and the guests it writes for, and none
+/// of this package's business.
+public struct WasmHostFunction: Sendable {
+    /// The import field name, e.g. `query` for `(import "diaryx" "query" …)`.
+    public let name: String
+
+    /// Answers one call. Throwing hands the guest the error's description in
+    /// place of a reply, and the guest decides what that means; it does not
+    /// end the run.
+    ///
+    /// The guest is blocked for as long as this takes, and nothing it wrote
+    /// before the call is held back: output is flushed first.
+    public let call: @Sendable (Data) async throws -> Data
+
+    public init(_ name: String, call: @escaping @Sendable (Data) async throws -> Data) {
+        self.name = name
+        self.call = call
+    }
+}
+
+/// A WebAssembly import module whose functions are answered by the embedder.
+///
+/// The calling convention is the same for every function in every module, so
+/// that a guest needs nothing generated to use one:
+///
+/// ```wat
+/// (import "diaryx" "query" (func $query (param i32 i32) (result i32)))
+/// (import "wasm_host" "take_reply" (func $take (param i32 i32) (result i32)))
+/// ```
+///
+/// - A call passes a pointer and a length: the request, in guest memory.
+/// - It returns `n >= 0` when the function answered with `n` bytes, or
+///   `-(n + 1)` when it threw, with `n` bytes of UTF-8 error message.
+/// - Either way the bytes are held for the guest, which collects them with
+///   `wasm_host.take_reply(ptr, capacity)`. That copies up to `capacity` bytes
+///   to `ptr`, returns how many it copied, and lets the reply go — so a guest
+///   with a buffer too small for what it was told the length was has lost the
+///   rest, and should have allocated what it was told.
+///
+/// Two calls rather than one because the reply's length is not known until the
+/// function has run, and a guest-supplied buffer that turned out too small
+/// would mean calling again — running a function with side effects twice.
+///
+/// `wasm_host` is reserved, and so are the names WASI's own modules use.
+public struct WasmHostModule: Sendable {
+    /// The import module name a guest names, e.g. `diaryx`.
+    public let name: String
+    public let functions: [WasmHostFunction]
+
+    /// The module through which a guest collects a reply.
+    public static let replyModule = "wasm_host"
+
+    /// Names a host module may not take, because something else answers them.
+    public static let reservedNames: Set<String> = [
+        replyModule, "wasi_snapshot_preview1", "wasi_unstable",
+    ]
+
+    public init(_ name: String, functions: [WasmHostFunction]) {
+        self.name = name
+        self.functions = functions
     }
 }
 
@@ -183,6 +279,7 @@ public enum WasmRuntimeError: LocalizedError {
     case missingEntryPoint(URL)
     case trapped(String)
     case needsWebView(String)
+    case invalidHostModule(String)
 
     public var errorDescription: String? {
         switch self {
@@ -195,8 +292,9 @@ public enum WasmRuntimeError: LocalizedError {
         case let .trapped(detail):
             "trapped: \(detail)"
         case let .needsWebView(name):
-            "\(name): this package needs the Web View engine — "
-                + "change it in Settings → WebAssembly"
+            "\(name): this program needs the web view backend"
+        case let .invalidHostModule(detail):
+            "invalid host module: \(detail)"
         }
     }
 }

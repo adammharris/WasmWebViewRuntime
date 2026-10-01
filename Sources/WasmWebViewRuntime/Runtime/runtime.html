@@ -2,7 +2,7 @@
 <html>
 <head>
 <meta charset="utf-8">
-<title>wish wasm runtime</title>
+<title>wasm web view runtime</title>
 </head>
 <body>
 <!--
@@ -19,7 +19,7 @@
 <script>
 'use strict';
 
-const bridge = window.webkit.messageHandlers.wish;
+const bridge = window.webkit.messageHandlers.wasmWebView;
 const runs = new Map();
 
 // Compiling a 9.6 MB module takes long enough that doing it once per command
@@ -179,7 +179,7 @@ async function loadModule(spec) {
 ///
 /// A read-only mount is cached and copied per run; a writable one is fetched
 /// fresh, because the guest may have changed it last time and the host is the
-/// authority. This is exactly the distinction `BinManifest.Access` was carrying.
+/// authority.
 async function loadSnapshot(preopen) {
   if (!preopen.readOnly) return await fetchBuffer(preopen.url);
   const cached = snapshots.get(preopen.signature);
@@ -197,7 +197,7 @@ async function ensureWorkerSource() {
   return workerSource;
 }
 
-const WishWasm = {
+const WasmWebView = {
   async start(spec) {
     const state = { worker: null, cancelled: false };
     runs.set(spec.run, state);
@@ -258,18 +258,18 @@ const WishWasm = {
           }
           // Last, so Swift knows every byte of output and every file has landed.
           send({ type: 'exit', run: spec.run, status: message.status, timing });
-          WishWasm.finish(spec.run);
+          WasmWebView.finish(spec.run);
           return;
         }
         if (message.type === 'failed') {
           send({ type: 'failed', run: spec.run, message: message.message });
-          WishWasm.finish(spec.run);
+          WasmWebView.finish(spec.run);
         }
       };
 
       worker.onerror = (event) => {
         send({ type: 'failed', run: spec.run, message: event.message || 'worker error' });
-        WishWasm.finish(spec.run);
+        WasmWebView.finish(spec.run);
       };
 
       worker.postMessage({
@@ -277,12 +277,16 @@ const WishWasm = {
         argv0: spec.argv0,
         arguments: spec.arguments,
         environment: spec.environment,
+        // Names only; a call goes to Swift over the same synchronous channel
+        // as stdin, at `syncURL + '/host/<module>/<function>'`.
+        hostModules: spec.hostModules,
         // Which of fd 0/1/2 the host says is a terminal, which is the whole of
         // what the guest can learn about it.
         tty: spec.tty,
         preopens: spec.preopens,
         snapshots: buffers,
-        // Where the worker makes its blocking calls — stdin reads and sleeps.
+        // Where the worker makes its blocking calls — stdin reads, sleeps,
+        // and host functions.
         // Both are synchronous XHRs, which is why they cannot go through this
         // page: the answer has to arrive without the worker's event loop
         // turning, and only Swift is on the other end.
@@ -290,7 +294,7 @@ const WishWasm = {
       }, buffers);
     } catch (error) {
       send({ type: 'failed', run: spec.run, message: String((error && error.stack) || error) });
-      WishWasm.finish(spec.run);
+      WasmWebView.finish(spec.run);
     }
   },
 
@@ -318,7 +322,7 @@ const WishWasm = {
   },
 };
 
-window.WishWasm = WishWasm;
+window.WasmWebView = WasmWebView;
 
 send({
   type: 'ready',
