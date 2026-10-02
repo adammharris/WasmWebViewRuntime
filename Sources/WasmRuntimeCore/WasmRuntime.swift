@@ -210,8 +210,21 @@ public struct WasmHostModule: Sendable {
 
 /// Where a running program's bytes come from and go to.
 public struct WasmStdio: Sendable {
-    /// Bytes the guest writes to stdout or stderr, in arrival order.
+    /// Bytes the guest writes to stdout, and to stderr too unless `onError`
+    /// is given — in arrival order either way.
     public let onOutput: @Sendable (Data) -> Void
+
+    /// Bytes the guest writes to stderr, kept apart from stdout.
+    ///
+    /// `nil`, the default, sends stderr to `onOutput`, interleaved with stdout
+    /// as the guest wrote them, which is what a terminal wants. A host that
+    /// parses a guest's stdout — replies, one per line — wants the guest's
+    /// log somewhere else, and gives this. The runtime's own complaints (a
+    /// write-back that failed) go here too when it is given.
+    ///
+    /// A backend that cannot tell the two streams apart sends both to
+    /// `onOutput`; the web view backend can.
+    public let onError: (@Sendable (Data) -> Void)?
 
     /// Bytes to feed the guest's stdin. Finishing the stream is EOF (Ctrl-D).
     public let input: AsyncStream<UInt8>
@@ -237,12 +250,14 @@ public struct WasmStdio: Sendable {
     public init(
         onOutput: @escaping @Sendable (Data) -> Void,
         input: AsyncStream<UInt8>,
+        onError: (@Sendable (Data) -> Void)? = nil,
         stdinIsTerminal: Bool = false,
         stdoutIsTerminal: Bool = false,
         stderrIsTerminal: Bool = false
     ) {
         self.onOutput = onOutput
         self.input = input
+        self.onError = onError
         self.stdinIsTerminal = stdinIsTerminal
         self.stdoutIsTerminal = stdoutIsTerminal
         self.stderrIsTerminal = stderrIsTerminal

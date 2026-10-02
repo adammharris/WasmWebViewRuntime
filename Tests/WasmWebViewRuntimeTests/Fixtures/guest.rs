@@ -6,6 +6,7 @@
 // - `count` calls `test.count` twice, so a test can see each call ran once.
 // - `short` collects a reply into a buffer too small for it, then again.
 // - `write` leaves `out.txt` in its working directory.
+// - `streams` writes two lines to stdout and two to stderr, alternating.
 //
 // Rebuild with:
 //     rustc --target wasm32-wasip1 -O -C strip=symbols -o guest.wasm guest.rs
@@ -83,6 +84,14 @@ fn main() {
         }
         "write" => {
             std::fs::write("out.txt", b"from the guest\n").unwrap();
+        }
+        "streams" => {
+            let mut err = io::stderr();
+            for n in 1..=2 {
+                writeln!(out, "out{n}").unwrap();
+                out.flush().unwrap();
+                writeln!(err, "err{n}").unwrap();
+            }
         }
         other => {
             eprintln!("unknown applet {other}");

@@ -322,14 +322,26 @@ function writeInto(node, offset, bytes) {
 /// stdout and stderr share one sink, so their interleaving reaches the terminal
 /// in the order the guest produced it — the same thing the interpreter backend
 /// gets by pointing both at one pipe.
+///
+/// When the host keeps them apart (`split`), each flush carries the stream it
+/// came from, and a write to the other stream flushes first, so the order
+/// between them still survives the crossing.
 class Output {
-  constructor() {
+  constructor(split) {
+    this.split = split === true;
+    this.stream = 1;
     this.buffer = [];
     this.pending = 0;
     this.lastFlush = 0;
   }
 
-  write(bytes) {
+  /// `stream` is 1 or 2, the fd written to.
+  write(bytes, stream) {
+    const to = this.split && stream === 2 ? 2 : 1;
+    if (to !== this.stream) {
+      this.flush();
+      this.stream = to;
+    }
     this.buffer.push(bytes.slice());
     this.pending += bytes.length;
     // Nothing else in this worker runs while the guest does, so a timer would
@@ -348,7 +360,7 @@ class Output {
     this.buffer = [];
     this.pending = 0;
     this.lastFlush = Date.now();
-    postMessage({ type: 'output', bytes: merged.buffer }, [merged.buffer]);
+    postMessage({ type: 'output', stream: this.stream, bytes: merged.buffer }, [merged.buffer]);
   }
 }
 
@@ -700,7 +712,7 @@ class WASI {
         const entry = self.fd(fd);
         const data = self.gather(iovs, iovsLen);
         if (entry.kind === 'stdout' || entry.kind === 'stderr') {
-          self.output.write(data);
+          self.output.write(data, entry.kind === 'stderr' ? 2 : 1);
         } else if (entry.kind === 'file') {
           self.guard(entry);
           const offset = entry.append ? entry.node.size : entry.offset;
@@ -1170,7 +1182,7 @@ class WASI {
 // MARK: - Entry point
 
 async function run(spec) {
-  const output = new Output();
+  const output = new Output(spec.splitStderr);
   const sync = new Sync(spec.syncURL);
   const trees = spec.preopens.map((p, i) => {
     const tree = new Tree(i, p.guestPath, p.readOnly);

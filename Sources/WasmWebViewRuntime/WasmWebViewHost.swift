@@ -96,7 +96,8 @@ public final class WasmWebViewHost: NSObject {
             overlay: program.overlay,
             moduleData: moduleData,
             hostModules: hostModules,
-            onOutput: stdio.onOutput
+            onOutput: stdio.onOutput,
+            onError: stdio.onError
         )
         runs[id] = state
 
@@ -149,6 +150,9 @@ public final class WasmWebViewHost: NSObject {
             // the answers genuinely differ: `python | cat` has a terminal on
             // stdin and a pipe on stdout.
             "tty": [stdio.stdinIsTerminal, stdio.stdoutIsTerminal, stdio.stderrIsTerminal],
+            // Whether stderr is tagged apart from stdout on its way out, or
+            // shares its sink so the two interleave as written.
+            "splitStderr": stdio.onError != nil,
             "preopens": preopens.enumerated().map { index, preopen in
                 [
                     "index": index,
@@ -674,7 +678,11 @@ extension WasmWebViewHost: WKScriptMessageHandler {
             guard let text = body["data"] as? String,
                   let data = Data(base64Encoded: text)
             else { return }
-            state.onOutput(data)
+            if body["stream"] as? Int == 2, let onError = state.onError {
+                onError(data)
+            } else {
+                state.onOutput(data)
+            }
 
         case "diff":
             // Timed because a 45 MB build cache crosses as base64 in 4 MB
@@ -720,7 +728,8 @@ extension WasmWebViewHost: WKScriptMessageHandler {
         let diff = state.diff
         let preopens = state.preopens
         let overlay = Set(state.overlay.map(\.guestPath))
-        let onOutput = state.onOutput
+        // The runtime's own complaints are not the guest's output.
+        let onOutput = state.onError ?? state.onOutput
 
         Task.detached(priority: .userInitiated) {
             if !diff.isEmpty {
@@ -791,6 +800,7 @@ private final class RunState {
     let moduleData: Data
     let hostModules: [String: [String: WasmHostFunction]]
     let onOutput: @Sendable (Data) -> Void
+    let onError: (@Sendable (Data) -> Void)?
     let stdin = StdinBuffer()
 
     var diff = Data()
@@ -804,13 +814,15 @@ private final class RunState {
         overlay: [WasmOverlay],
         moduleData: Data,
         hostModules: [String: [String: WasmHostFunction]],
-        onOutput: @escaping @Sendable (Data) -> Void
+        onOutput: @escaping @Sendable (Data) -> Void,
+        onError: (@Sendable (Data) -> Void)?
     ) {
         self.preopens = preopens
         self.overlay = overlay
         self.moduleData = moduleData
         self.hostModules = hostModules
         self.onOutput = onOutput
+        self.onError = onError
     }
 
     /// Resumes exactly once. A run can be finished by its exit message, by

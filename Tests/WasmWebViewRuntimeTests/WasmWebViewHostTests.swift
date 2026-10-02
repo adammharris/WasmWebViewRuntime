@@ -53,6 +53,18 @@ struct WasmWebViewHostTests {
         #expect(result.output == "status=11 first=3 ech second=0\n")
     }
 
+    @Test func stderrSharesStdoutsSinkByDefault() async throws {
+        let result = try await run("streams", [])
+        #expect(result.output == "out1\nerr1\nout2\nerr2\n")
+        #expect(result.errors == "")
+    }
+
+    @Test func stderrIsKeptApartWhenAsked() async throws {
+        let result = try await run("streams", [], splitStderr: true)
+        #expect(result.output == "out1\nout2\n")
+        #expect(result.errors == "err1\nerr2\n")
+    }
+
     @Test func writesComeBackToTheHost() async throws {
         let result = try await run("write", [])
         #expect(result.status == 0)
@@ -89,6 +101,7 @@ struct WasmWebViewHostTests {
 
     struct Result {
         let output: String
+        let errors: String
         let status: Int32
         let root: URL
     }
@@ -119,7 +132,8 @@ struct WasmWebViewHostTests {
         environment: [String: String] = WasmProgram.defaultEnvironment,
         // The fixture is one module, so every applet imports `test.*` whether
         // it calls it or not, and every run has to offer it.
-        modules: [WasmHostModule]? = nil
+        modules: [WasmHostModule]? = nil,
+        splitStderr: Bool = false
     ) async throws -> Result {
         let root = FileManager.default.temporaryDirectory
             .appending(path: "WasmWebViewRuntimeTests-\(UUID().uuidString)")
@@ -137,9 +151,13 @@ struct WasmWebViewHostTests {
             for byte in stdin.utf8 { continuation.yield(byte) }
             continuation.finish()
         }
+        let errors = OutputBox()
+        let onError: (@Sendable (Data) -> Void)? =
+            splitStderr ? { @Sendable in errors.append($0) } : nil
         let status = try await Self.host.run(
-            program, stdio: WasmStdio(onOutput: { output.append($0) }, input: input))
-        return Result(output: output.text, status: status, root: root)
+            program,
+            stdio: WasmStdio(onOutput: { output.append($0) }, input: input, onError: onError))
+        return Result(output: output.text, errors: errors.text, status: status, root: root)
     }
 
     final class OutputBox: @unchecked Sendable {

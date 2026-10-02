@@ -46,6 +46,14 @@ let status = try await host.run(
 Cancelling the surrounding task terminates the guest's worker, which stops it
 even in a loop that makes no system calls.
 
+stderr reaches `onOutput` interleaved with stdout, as a terminal wants it. A
+host that parses what a guest prints — one reply per line, say — can keep the
+guest's log out of it with `onError`:
+
+```swift
+WasmStdio(onOutput: { replies.append($0) }, input: requests, onError: { log.append($0) })
+```
+
 ## Host functions
 
 A guest can call functions the app provides. Group them into a module and put

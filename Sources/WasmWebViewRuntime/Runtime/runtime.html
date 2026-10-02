@@ -237,7 +237,10 @@ const WasmWebView = {
       worker.onmessage = (event) => {
         const message = event.data;
         if (message.type === 'output') {
-          send({ type: 'output', run: spec.run, data: base64(new Uint8Array(message.bytes)) });
+          send({
+            type: 'output', run: spec.run, stream: message.stream,
+            data: base64(new Uint8Array(message.bytes)),
+          });
           return;
         }
         if (message.type === 'exit') {
@@ -283,6 +286,8 @@ const WasmWebView = {
         // Which of fd 0/1/2 the host says is a terminal, which is the whole of
         // what the guest can learn about it.
         tty: spec.tty,
+        // Whether stderr leaves tagged as its own stream.
+        splitStderr: spec.splitStderr === true,
         preopens: spec.preopens,
         snapshots: buffers,
         // Where the worker makes its blocking calls — stdin reads, sleeps,
